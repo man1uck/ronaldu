@@ -1,0 +1,212 @@
+name: Deploy
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+
+jobs:
+  build-and-push:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Normalize image name
+        id: image
+        run: |
+          echo "name=${REGISTRY}/$(echo '${{ github.repository }}' | tr '[:upper:]' '[:lower:]')" >> "$GITHUB_OUTPUT"
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: docker/metadata-action@v5
+        id: meta
+        with:
+          images: ${{ steps.image.outputs.name }}
+          tags: |
+            type=sha,prefix=
+            type=raw,value=latest
+
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+
+  deploy:
+    needs: build-and-push
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Copy config files to server
+        uses: appleboy/scp-action@v0.1.7
+        with:
+          host: ${{ secrets.SSH_HOST }}
+          username: ${{ secrets.SSH_USER }}
+          key: ${{ secrets.SSH_KEY }}
+          port: ${{ secrets.SSH_PORT || 22 }}
+          source: "deploy/docker-compose.yml,deploy/nginx.conf,scripts/deploy/init-letsencrypt.sh,prisma/schema.prisma,prisma.config.ts"
+          target: ~/club
+
+      - name: Deploy via SSH
+        uses: appleboy/ssh-action@v1.2.0
+        with:
+          host: ${{ secrets.SSH_HOST }}
+          username: ${{ secrets.SSH_USER }}
+          key: ${{ secrets.SSH_KEY }}
+          port: ${{ secrets.SSH_PORT || 22 }}
+          script: |
+            set -euo pipefail
+
+            cd ~/club
+            mkdir -p deploy scripts/deploy src/db
+            export PATH="/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:/snap/bin:$PATH"
+
+            EXISTING_WEBHOOK_SECRET=""
+            EXISTING_APP_URL=""
+            if [ -f .env ]; then
+              EXISTING_WEBHOOK_SECRET=$(grep '^TELEGRAM_WEBHOOK_SECRET=' .env | cut -d= -f2- || true)
+              EXISTING_APP_URL=$(grep '^APP_URL=' .env | cut -d= -f2- || true)
+            fi
+
+            if [ -n "${{ secrets.TELEGRAM_WEBHOOK_SECRET }}" ]; then
+              TELEGRAM_WEBHOOK_SECRET_VALUE="${{ secrets.TELEGRAM_WEBHOOK_SECRET }}"
+            elif [ -n "$EXISTING_WEBHOOK_SECRET" ]; then
+              TELEGRAM_WEBHOOK_SECRET_VALUE="$EXISTING_WEBHOOK_SECRET"
+            else
+              TELEGRAM_WEBHOOK_SECRET_VALUE=$(openssl rand -hex 32)
+            fi
+
+            if [ -n "${{ secrets.APP_URL }}" ]; then
+              APP_URL_VALUE="${{ secrets.APP_URL }}"
+            elif [ -n "$EXISTING_APP_URL" ]; then
+              APP_URL_VALUE="$EXISTING_APP_URL"
+            elif [ -n "${{ secrets.DOMAIN }}" ]; then
+              APP_URL_VALUE="https://${{ secrets.DOMAIN }}"
+            else
+              APP_URL_VALUE=""
+            fi
+
+            resolve_docker() {
+              if command -v docker >/dev/null 2>&1; then
+                echo "docker"
+                return
+              fi
+
+              for candidate in /usr/bin/docker /usr/local/bin/docker /snap/bin/docker; do
+                if [ -x "$candidate" ]; then
+                  echo "$candidate"
+                  return
+                fi
+              done
+
+              if command -v sudo >/dev/null 2>&1; then
+                for candidate in /usr/bin/docker /usr/local/bin/docker /snap/bin/docker; do
+                  if sudo test -x "$candidate" 2>/dev/null; then
+                    echo "sudo $candidate"
+                    return
+                  fi
+                done
+              fi
+
+              echo "Docker не найден на сервере. Сначала выполните scripts/deploy/setup-server.sh или установите Docker вручную." >&2
+              exit 127
+            }
+
+            DOCKER="$(resolve_docker)"
+            if [ -z "$DOCKER" ]; then
+              echo "Docker не найден на сервере. Сначала выполните scripts/deploy/setup-server.sh или установите Docker вручную." >&2
+              exit 127
+            fi
+
+            # Write runtime environment file from GitHub secrets
+            cat > .env <<EOF
+            POSTGRES_USER=${{ secrets.POSTGRES_USER || 'club' }}
+            POSTGRES_PASSWORD=${{ secrets.POSTGRES_PASSWORD }}
+            POSTGRES_DB=${{ secrets.POSTGRES_DB || 'club' }}
+            DATABASE_URL=postgresql://${{ secrets.POSTGRES_USER || 'club' }}:${{ secrets.POSTGRES_PASSWORD }}@db:5432/${{ secrets.POSTGRES_DB || 'club' }}
+            BOT_TOKEN=${{ secrets.BOT_TOKEN }}
+            TELEGRAM_WEBHOOK_SECRET=$TELEGRAM_WEBHOOK_SECRET_VALUE
+            APP_URL=$APP_URL_VALUE
+            DOMAIN=${{ secrets.DOMAIN }}
+            EMAIL=${{ secrets.EMAIL }}
+            EOF
+
+            if [ -z "${{ secrets.POSTGRES_PASSWORD }}" ] || [ -z "${{ secrets.BOT_TOKEN }}" ]; then
+              echo "POSTGRES_PASSWORD и BOT_TOKEN должны быть заданы в GitHub Secrets." >&2
+              exit 1
+            fi
+
+            COMPOSE="$DOCKER compose -p club --env-file .env -f deploy/docker-compose.yml"
+
+            # Login to GHCR
+            echo "${{ secrets.GITHUB_TOKEN }}" | $DOCKER login ghcr.io -u ${{ github.actor }} --password-stdin
+
+            # Set image tag
+            IMAGE_REPO=$(printf '%s' '${{ github.repository }}' | tr '[:upper:]' '[:lower:]')
+            export IMAGE=${{ env.REGISTRY }}/$IMAGE_REPO:latest
+
+            # Substitute domain in nginx.conf
+            DOMAIN="${{ secrets.DOMAIN }}"
+            EMAIL="${{ secrets.EMAIL }}"
+            if [ -n "$DOMAIN" ]; then
+              sed -i "s/DOMAIN/$DOMAIN/g" deploy/nginx.conf
+              sed -i "s/server_name _;/server_name $DOMAIN;/g" deploy/nginx.conf
+            fi
+
+            # Pull new image and restart
+            $COMPOSE pull app
+            $COMPOSE up -d
+
+            # Init SSL if certificate doesn't exist yet
+            if [ -n "$DOMAIN" ] && [ -n "$EMAIL" ]; then
+              if ! $COMPOSE run --rm --no-deps --entrypoint sh certbot -c "test -f /etc/letsencrypt/live/$DOMAIN/fullchain.pem"; then
+                chmod +x scripts/deploy/init-letsencrypt.sh
+                bash scripts/deploy/init-letsencrypt.sh "$DOMAIN" "$EMAIL"
+              fi
+            fi
+
+            # Run migrations
+            $DOCKER run --rm \
+              --network club_default \
+              --env-file .env \
+              -v "$PWD/prisma/schema.prisma:/workspace/prisma/schema.prisma:ro" \
+              -v "$PWD/prisma.config.ts:/workspace/prisma.config.ts:ro" \
+              -w /workspace \
+              node:22-alpine \
+              sh -c "npm init -y >/dev/null 2>&1 && npm install --no-package-lock prisma dotenv >/dev/null 2>&1 && npx prisma db push --schema=prisma/schema.prisma"
+
+            # Configure Telegram webhook automatically
+            if [ -n "$APP_URL_VALUE" ]; then
+              WEBHOOK_BASE_URL=${APP_URL_VALUE%/}
+            elif [ -n "$DOMAIN" ]; then
+              WEBHOOK_BASE_URL="https://$DOMAIN"
+            else
+              WEBHOOK_BASE_URL=""
+            fi
+
+            if [ -n "$WEBHOOK_BASE_URL" ] && [ -n "$TELEGRAM_WEBHOOK_SECRET_VALUE" ]; then
+              WEBHOOK_URL="$WEBHOOK_BASE_URL/api/telegram/webhook"
+              curl -fsS -X POST "https://api.telegram.org/bot${{ secrets.BOT_TOKEN }}/setWebhook" \
+                -H "Content-Type: application/json" \
+                -d "{\"url\":\"$WEBHOOK_URL\",\"secret_token\":\"$TELEGRAM_WEBHOOK_SECRET_VALUE\",\"allowed_updates\":[\"message\"]}"
+            else
+              echo "Skip Telegram webhook setup: APP_URL/DOMAIN is not configured."
+            fi
+
+            # Cleanup old images
+            $DOCKER image prune -f
